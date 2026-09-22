@@ -27,6 +27,14 @@ enum EnvironmentChecker {
                 return .hibernated
             }
 
+            // A "restarting" environment serves a minimal login page
+            // without the full Coral UI form. The actual login form
+            // (with class="coral-Form") only appears once AEM is
+            // fully started and ready to accept logins.
+            if body.range(of: "coral-Form", options: .caseInsensitive) == nil {
+                return .hibernated  // treat "restarting" as still not ready
+            }
+
             return .up
 
         } catch let error as URLError {
