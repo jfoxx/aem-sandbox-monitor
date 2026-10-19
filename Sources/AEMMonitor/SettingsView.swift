@@ -154,8 +154,47 @@ struct NotificationSettingsSection: View {
                 Button("Send Test") { model.sendTestNotification() }
                     .controlSize(.small)
             }
+
+            diagnostics
         }
         .onAppear { model.refreshNotificationAuthorization() }
+    }
+
+    private func openNotificationSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Always-visible status so a failure is never silent.
+    @ViewBuilder
+    private var diagnostics: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if let err = model.lastNotificationError {
+                Text(err)
+                    .font(.caption2)
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if model.canUseNotificationCenter,
+               model.notificationAuthorization == .authorized,
+               model.notificationAlertStyle == .none {
+                HStack(spacing: 4) {
+                    Text("Allowed, but banner style is None: notifications go to Notification Center only.")
+                        .font(.caption2)
+                        .foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Fix") { openNotificationSettings() }
+                        .buttonStyle(.link)
+                        .font(.caption2)
+                }
+            }
+            if let sent = model.lastNotificationSent {
+                Text("Last sent to macOS: \(sent.formatted(date: .omitted, time: .standard))")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
     }
 
     @ViewBuilder
@@ -171,11 +210,7 @@ struct NotificationSettingsSection: View {
                     Text("Blocked in System Settings.")
                         .font(.caption2)
                         .foregroundColor(.red)
-                    Button("Open") {
-                        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
-                            NSWorkspace.shared.open(url)
-                        }
-                    }
+                    Button("Open") { openNotificationSettings() }
                     .buttonStyle(.link)
                     .font(.caption2)
                 }
@@ -183,8 +218,12 @@ struct NotificationSettingsSection: View {
                 Button("Allow Notifications") { model.requestNotificationPermission() }
                     .buttonStyle(.link)
                     .font(.caption2)
-            default:
+            case .authorized, .provisional:
                 Text("Allowed")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            default:
+                Text("Permission state \(model.notificationAuthorization.rawValue)")
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }

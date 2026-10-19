@@ -2,6 +2,14 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>CFBundleExecutable</key>
+    <string>AEMMonitor</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
     <key>CFBundleIdentifier</key>
     <string>com.adobe.aem-monitor</string>
     <key>CFBundleName</key>
@@ -9,9 +17,9 @@
     <key>CFBundleDisplayName</key>
     <string>AEM Monitor</string>
     <key>CFBundleVersion</key>
-    <string>1.1</string>
+    <string>1.1.1</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.1.0</string>
+    <string>1.1.1</string>
     <key>LSUIElement</key>
     <true/>
     <key>NSUserNotificationAlertStyle</key>

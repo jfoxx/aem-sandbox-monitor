@@ -23,6 +23,17 @@ final class EnvironmentModel: ObservableObject {
     /// macOS notification permission, refreshed on launch and from Settings.
     @Published var notificationAuthorization: UNAuthorizationStatus = .notDetermined
 
+    /// macOS-level banner style for this app (.none means delivered silently
+    /// to Notification Center only, with no banner).
+    @Published var notificationAlertStyle: UNAlertStyle = .none
+
+    /// Last error reported by UNUserNotificationCenter, shown in Settings so
+    /// failures are never silent.
+    @Published var lastNotificationError: String? = nil
+
+    /// Time the last notification was handed to macOS successfully.
+    @Published var lastNotificationSent: Date? = nil
+
     // MARK: - Internals
 
     private let pollInterval: TimeInterval = 30
@@ -290,8 +301,14 @@ final class EnvironmentModel: ObservableObject {
 
     func requestNotificationPermission() {
         guard canUseNotificationCenter else { return }
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in
-            Task { @MainActor in self.refreshNotificationAuthorization() }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
+            NSLog("AEMMonitor: requestAuthorization granted=\(granted) error=\(String(describing: error))")
+            Task { @MainActor in
+                if let error {
+                    self.lastNotificationError = "Permission request failed: \(error.localizedDescription)"
+                }
+                self.refreshNotificationAuthorization()
+            }
         }
     }
 
@@ -299,12 +316,22 @@ final class EnvironmentModel: ObservableObject {
         guard canUseNotificationCenter else { return }
         UNUserNotificationCenter.current().getNotificationSettings { s in
             let status = s.authorizationStatus
-            Task { @MainActor in self.notificationAuthorization = status }
+            let style = s.alertStyle
+            NSLog("AEMMonitor: notification authorization=\(status.rawValue) alertStyle=\(style.rawValue)")
+            Task { @MainActor in
+                self.notificationAuthorization = status
+                self.notificationAlertStyle = style
+            }
         }
     }
 
     /// Fires a sample notification so the user can confirm banners appear.
+    /// If permission was never decided, asks first.
     func sendTestNotification() {
+        lastNotificationError = nil
+        if canUseNotificationCenter && notificationAuthorization == .notDetermined {
+            requestNotificationPermission()
+        }
         deliver(title: "AEM Monitor",
                 body: "Test notification. Status changes will appear like this.",
                 threadId: "aem-monitor-test",
@@ -357,6 +384,16 @@ final class EnvironmentModel: ObservableObject {
             content: content,
             trigger: nil
         )
-        UNUserNotificationCenter.current().add(request)
+        UNUserNotificationCenter.current().add(request) { error in
+            NSLog("AEMMonitor: deliver '\(title)' error=\(String(describing: error))")
+            Task { @MainActor in
+                if let error {
+                    self.lastNotificationError = "Delivery failed: \(error.localizedDescription)"
+                } else {
+                    self.lastNotificationSent = Date()
+                }
+                self.refreshNotificationAuthorization()
+            }
+        }
     }
 }
