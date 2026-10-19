@@ -70,7 +70,7 @@ On first launch (no config file), the app:
 - **Menu bar icon** — cloud icon with color state (gray=idle, orange=watching, green=awake)
 - **Watch individual environments** or "Watch All" to monitor everything
 - **30-second polling** with countdown display
-- **macOS notification** when an environment wakes up (title: "AEM Environment Ready")
+- **macOS notifications on status change** for watched environments: Ready, Starting (de-hibernating), Hibernated, Down. Configurable in Settings: every change or only when up, sound on/off, and an option to keep watching after wake so a later re-hibernation is reported. Clicking a notification opens that environment's author. Transient errors (timeouts, network blips) never notify. A **Send Test** button confirms banners are allowed.
 - **Agent app** — no dock icon, lives entirely in the menu bar
 - **Graceful error handling** — timeouts, network errors shown inline without crashing
 - **Shareable** — anyone with Cloud Manager access can configure their own programs

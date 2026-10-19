@@ -1,4 +1,6 @@
+import AppKit
 import SwiftUI
+import UserNotifications
 
 /// Settings view for managing programs and environments.
 struct SettingsView: View {
@@ -43,6 +45,10 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .padding(.bottom, 4)
+
+                    NotificationSettingsSection(model: model)
+
+                    Divider()
 
                     // Existing programs
                     ForEach(model.config.programs.indices, id: \.self) { pi in
@@ -99,6 +105,88 @@ struct SettingsView: View {
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
+            }
+        }
+    }
+}
+
+// MARK: - Notification Settings
+
+struct NotificationSettingsSection: View {
+    @ObservedObject var model: EnvironmentModel
+
+    /// Binding that writes through to config.json on every change.
+    @MainActor
+    private func binding<T>(_ keyPath: WritableKeyPath<NotificationSettings, T>) -> Binding<T> {
+        Binding(
+            get: { model.notificationSettings[keyPath: keyPath] },
+            set: { newValue in model.updateNotificationSettings { $0[keyPath: keyPath] = newValue } }
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Notifications")
+                .font(.subheadline.weight(.semibold))
+
+            Toggle("Notify when a watched environment changes", isOn: binding(\.enabled))
+                .font(.caption)
+
+            Group {
+                Picker("Notify on", selection: binding(\.mode)) {
+                    Text("Every status change").tag(NotifyMode.allChanges)
+                    Text("Only when it's up").tag(NotifyMode.wakeOnly)
+                }
+                .pickerStyle(.radioGroup)
+                .font(.caption)
+
+                Toggle("Play sound", isOn: binding(\.sound))
+                    .font(.caption)
+
+                Toggle("Keep watching after it's up (report re-hibernation)", isOn: binding(\.keepWatchingWhenUp))
+                    .font(.caption)
+            }
+            .disabled(!model.notificationSettings.enabled)
+
+            HStack(spacing: 8) {
+                permissionLabel
+                Spacer()
+                Button("Send Test") { model.sendTestNotification() }
+                    .controlSize(.small)
+            }
+        }
+        .onAppear { model.refreshNotificationAuthorization() }
+    }
+
+    @ViewBuilder
+    private var permissionLabel: some View {
+        if !model.canUseNotificationCenter {
+            Text("Running via swift run: sound + log only. Use build-app.sh for banners.")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        } else {
+            switch model.notificationAuthorization {
+            case .denied:
+                HStack(spacing: 4) {
+                    Text("Blocked in System Settings.")
+                        .font(.caption2)
+                        .foregroundColor(.red)
+                    Button("Open") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption2)
+                }
+            case .notDetermined:
+                Button("Allow Notifications") { model.requestNotificationPermission() }
+                    .buttonStyle(.link)
+                    .font(.caption2)
+            default:
+                Text("Allowed")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
             }
         }
     }

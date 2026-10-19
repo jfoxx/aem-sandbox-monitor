@@ -20,11 +20,19 @@ final class EnvironmentModel: ObservableObject {
     /// Callback the AppDelegate hooks into to flash the menu bar icon.
     var onEnvironmentWokeUp: (() -> Void)?
 
+    /// macOS notification permission, refreshed on launch and from Settings.
+    @Published var notificationAuthorization: UNAuthorizationStatus = .notDetermined
+
     // MARK: - Internals
 
     private let pollInterval: TimeInterval = 30
     private var timers: [String: Timer] = [:]          // env composite id → Timer
     private var countdownTimers: [String: Timer] = [:]  // env composite id → 1-sec ticker
+
+    /// Last *settled* status per watched environment (never .checking or
+    /// .error). Used to detect transitions; cleared when a watch stops so a
+    /// new watch starts from a fresh baseline.
+    private var lastSettled: [String: EnvironmentStatus] = [:]
 
     // MARK: - Init
 
@@ -132,6 +140,15 @@ final class EnvironmentModel: ObservableObject {
         rebuildPrograms()
     }
 
+    // MARK: - Notification settings
+
+    var notificationSettings: NotificationSettings { config.notifications }
+
+    func updateNotificationSettings(_ change: (inout NotificationSettings) -> Void) {
+        change(&config.notifications)
+        ConfigStore.save(config)
+    }
+
     // MARK: - Polling actions
 
     func startWatching(programIndex: Int, envIndex: Int) {
@@ -216,6 +233,7 @@ final class EnvironmentModel: ObservableObject {
         timers.removeValue(forKey: compositeId)
         countdownTimers[compositeId]?.invalidate()
         countdownTimers.removeValue(forKey: compositeId)
+        lastSettled.removeValue(forKey: compositeId)
     }
 
     private func poll(programIndex pi: Int, envIndex ei: Int) {
@@ -235,34 +253,104 @@ final class EnvironmentModel: ObservableObject {
             programs[pi].environments[ei].secondsUntilNext = Int(pollInterval)
             lastGlobalCheck = Date()
 
+            // Transient errors (timeouts, network blips) are shown inline but
+            // never notify and never move the baseline, so a single dropped
+            // request does not produce a pair of spurious notifications.
+            if case .error(_) = result { return }
+
+            let previous = lastSettled[env.id]   // nil on the first poll of a watch
+            lastSettled[env.id] = result
+            let settings = config.notifications
+            let programName = programs[pi].name
+
             if result == .up {
-                let programName = programs[pi].name
-                let envName = env.name
-                stopWatching(programIndex: pi, envIndex: ei)
-                sendNotification(program: programName, env: envName)
-                onEnvironmentWokeUp?()
+                // Notify on wake, including "already up" on the first poll
+                // (the original 1.0 behaviour), but not on every poll while
+                // it stays up when keepWatchingWhenUp is on.
+                if previous != .up {
+                    sendNotification(env: env, programName: programName,
+                                     from: previous, to: result, settings: settings)
+                    onEnvironmentWokeUp?()
+                }
+                if !settings.keepWatchingWhenUp {
+                    stopWatching(programIndex: pi, envIndex: ei)
+                }
+            } else if let previous, previous != result, settings.mode == .allChanges {
+                sendNotification(env: env, programName: programName,
+                                 from: previous, to: result, settings: settings)
             }
         }
     }
 
     // MARK: - Notifications
 
+    /// True when running as a real .app bundle. `swift run` has no bundle
+    /// identifier and UNUserNotificationCenter would crash there.
+    var canUseNotificationCenter: Bool { Bundle.main.bundleIdentifier != nil }
+
     func requestNotificationPermission() {
-        guard Bundle.main.bundleIdentifier != nil else { return }
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        guard canUseNotificationCenter else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in
+            Task { @MainActor in self.refreshNotificationAuthorization() }
+        }
     }
 
-    private func sendNotification(program: String, env: String) {
+    func refreshNotificationAuthorization() {
+        guard canUseNotificationCenter else { return }
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            let status = s.authorizationStatus
+            Task { @MainActor in self.notificationAuthorization = status }
+        }
+    }
+
+    /// Fires a sample notification so the user can confirm banners appear.
+    func sendTestNotification() {
+        deliver(title: "AEM Monitor",
+                body: "Test notification. Status changes will appear like this.",
+                threadId: "aem-monitor-test",
+                url: nil,
+                sound: config.notifications.sound)
+    }
+
+    private func sendNotification(env: AEMEnvironment, programName: String,
+                                  from previous: EnvironmentStatus?, to current: EnvironmentStatus,
+                                  settings: NotificationSettings) {
+        guard settings.enabled else { return }
+
+        let title: String
+        switch current {
+        case .up:         title = "AEM Environment Ready"
+        case .starting:   title = "AEM Environment Starting"
+        case .hibernated: title = "AEM Environment Hibernated"
+        case .down:       title = "AEM Environment Down"
+        default:          title = "AEM Environment \(current.label)"
+        }
+
+        let location = "\(programName)/\(env.name) (\(env.envId))"
+        let body: String
+        if let previous {
+            body = "\(location): \(previous.label) \u{2192} \(current.label)"
+        } else {
+            body = "\(location) is \(current.label.lowercased())"   // first poll, e.g. already up
+        }
+
+        deliver(title: title, body: body, threadId: env.id,
+                url: env.authorURL, sound: settings.sound)
+    }
+
+    private func deliver(title: String, body: String, threadId: String, url: URL?, sound: Bool) {
         // Fallback: use NSSound + NSLog if no bundle identifier (swift run)
-        guard Bundle.main.bundleIdentifier != nil else {
-            NSSound(named: "Purr")?.play()
-            NSLog("AEM Environment Ready: \(program)/\(env) is now awake")
+        guard canUseNotificationCenter else {
+            if sound { NSSound(named: "Purr")?.play() }
+            NSLog("\(title): \(body)")
             return
         }
         let content = UNMutableNotificationContent()
-        content.title = "AEM Environment Ready"
-        content.body = "\(program)/\(env) is now awake"
-        content.sound = .default
+        content.title = title
+        content.body = body
+        content.threadIdentifier = threadId          // groups per environment
+        if sound { content.sound = .default }
+        if let url { content.userInfo = ["url": url.absoluteString] }
 
         let request = UNNotificationRequest(
             identifier: UUID().uuidString,

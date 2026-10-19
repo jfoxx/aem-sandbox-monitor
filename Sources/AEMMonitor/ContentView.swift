@@ -164,6 +164,7 @@ struct EnvironmentRow: View {
         HStack(spacing: 8) {
             Text(env.status.icon)
                 .font(.system(size: 10))
+                .help(env.status.label)
 
             Text(env.displayLabel)
                 .font(.system(.body, design: .monospaced))

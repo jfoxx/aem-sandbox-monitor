@@ -15,13 +15,60 @@ struct ProgramConfig: Codable, Identifiable, Equatable {
     var environments: [EnvironmentConfig]
 }
 
+/// Which status changes produce a macOS notification.
+enum NotifyMode: String, Codable, CaseIterable {
+    case allChanges   // any settled change: hibernated / starting / up / down
+    case wakeOnly     // only when an environment becomes fully up
+}
+
+/// User-configurable notification behaviour, persisted alongside programs.
+struct NotificationSettings: Codable, Equatable {
+    var enabled: Bool = true
+    var mode: NotifyMode = .allChanges
+    var sound: Bool = true
+    /// When false (original behaviour) watching stops once an environment is up.
+    /// When true, polling continues so a later hibernation is also reported.
+    var keepWatchingWhenUp: Bool = false
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, mode, sound, keepWatchingWhenUp
+    }
+}
+
+extension NotificationSettings {
+    /// Tolerant decoding: any missing key falls back to its default.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = NotificationSettings()
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? d.enabled
+        mode = try c.decodeIfPresent(NotifyMode.self, forKey: .mode) ?? d.mode
+        sound = try c.decodeIfPresent(Bool.self, forKey: .sound) ?? d.sound
+        keepWatchingWhenUp = try c.decodeIfPresent(Bool.self, forKey: .keepWatchingWhenUp) ?? d.keepWatchingWhenUp
+    }
+}
+
 /// Top-level config file structure.
 struct AppConfig: Codable, Equatable {
     var programs: [ProgramConfig]
+    var notifications: NotificationSettings = NotificationSettings()
+
+    enum CodingKeys: String, CodingKey {
+        case programs, notifications
+    }
 
     static let empty = AppConfig(programs: [])
 
     static let defaults = AppConfig(programs: [])
+}
+
+extension AppConfig {
+    /// Tolerant decoding so config.json files written by 1.0 (no
+    /// "notifications" key) still load instead of being treated as first launch.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        programs = try c.decode([ProgramConfig].self, forKey: .programs)
+        notifications = try c.decodeIfPresent(NotificationSettings.self, forKey: .notifications) ?? NotificationSettings()
+    }
 }
 
 // MARK: - Config Store (JSON file persistence)
@@ -58,6 +105,7 @@ enum EnvironmentStatus: Equatable {
     case unknown
     case checking
     case up
+    case starting    // de-hibernating: no "hibernated" text, but no login form yet
     case hibernated
     case down
     case error(String)
@@ -67,6 +115,7 @@ enum EnvironmentStatus: Equatable {
         case .unknown:        return "Unknown"
         case .checking:       return "Checking…"
         case .up:             return "Up"
+        case .starting:       return "Starting"
         case .hibernated:     return "Hibernated"
         case .down:           return "Down"
         case .error(let msg): return "Error: \(msg)"
@@ -78,6 +127,7 @@ enum EnvironmentStatus: Equatable {
         case .unknown:    return "⚫"
         case .checking:   return "🟡"
         case .up:         return "🟢"
+        case .starting:   return "🟠"
         case .hibernated: return "⚫"
         case .down:       return "🔴"
         case .error:      return "🔴"
@@ -89,6 +139,7 @@ enum EnvironmentStatus: Equatable {
         case (.unknown, .unknown),
              (.checking, .checking),
              (.up, .up),
+             (.starting, .starting),
              (.hibernated, .hibernated),
              (.down, .down):
             return true
@@ -114,6 +165,11 @@ struct AEMEnvironment: Identifiable {
 
     var url: URL {
         URL(string: "https://author-p\(programId)-e\(envId).adobeaemcloud.com/libs/granite/core/content/login.html")!
+    }
+
+    /// Author root, opened when the user clicks a notification.
+    var authorURL: URL {
+        URL(string: "https://author-p\(programId)-e\(envId).adobeaemcloud.com/")!
     }
 
     var displayLabel: String {

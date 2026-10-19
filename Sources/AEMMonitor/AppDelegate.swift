@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import SwiftUI
+import UserNotifications
 
 /// Manages the NSStatusItem (menu bar icon) and the popover.
 @MainActor
@@ -52,7 +53,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
-        // Request notification permission now that the app is running.
+        // Request notification permission now that the app is running, and
+        // become the delegate so banners also show while the popover is open
+        // and clicks open the environment.
+        if model.canUseNotificationCenter {
+            UNUserNotificationCenter.current().delegate = self
+        }
         model.requestNotificationPermission()
 
         // On first launch the model sets showSettings = true,
@@ -104,6 +110,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    fileprivate func openFromNotification(_ urlString: String?) {
+        guard let urlString, let url = URL(string: urlString) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     private func flashGreen() {
         guard let button = statusItem?.button else { return }
         button.contentTintColor = .systemGreen
@@ -113,6 +124,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in
                 self?.updateIcon()
             }
+        }
+    }
+}
+
+// MARK: - UNUserNotificationCenterDelegate
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+
+    /// Without this, macOS suppresses banners whenever the app is frontmost,
+    /// which for a menu bar app includes the moment the popover is open.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            willPresent notification: UNNotification,
+                                            withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list, .sound])
+    }
+
+    /// Clicking a status-change notification opens that environment's author.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            didReceive response: UNNotificationResponse,
+                                            withCompletionHandler completionHandler: @escaping () -> Void) {
+        let urlString = response.notification.request.content.userInfo["url"] as? String
+        Task { @MainActor in
+            self.openFromNotification(urlString)
+            completionHandler()
         }
     }
 }

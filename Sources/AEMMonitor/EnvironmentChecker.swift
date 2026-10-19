@@ -17,14 +17,16 @@ enum EnvironmentChecker {
                 return .error("Non-HTTP response")
             }
 
-            guard http.statusCode == 200 else {
-                return .down
-            }
-
-            // Body inspection — the critical check.
+            // Body inspection — the critical check. Done before the status
+            // code check because the devconsole hibernation page can be
+            // served with a non-200 code (e.g. 503).
             let body = String(data: data, encoding: .utf8) ?? ""
             if body.range(of: "hibernat", options: .caseInsensitive) != nil {
                 return .hibernated
+            }
+
+            guard http.statusCode == 200 else {
+                return .down
             }
 
             // A "restarting" environment serves a minimal login page
@@ -32,7 +34,7 @@ enum EnvironmentChecker {
             // (with class="coral-Form") only appears once AEM is
             // fully started and ready to accept logins.
             if body.range(of: "coral-Form", options: .caseInsensitive) == nil {
-                return .hibernated  // treat "restarting" as still not ready
+                return .starting  // de-hibernating, not yet accepting logins
             }
 
             return .up
