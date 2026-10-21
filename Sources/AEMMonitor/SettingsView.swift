@@ -50,6 +50,10 @@ struct SettingsView: View {
 
                     Divider()
 
+                    CloudManagerAccountsSection(model: model)
+
+                    Divider()
+
                     // Existing programs
                     ForEach(model.config.programs.indices, id: \.self) { pi in
                         ProgramSettingsCard(
@@ -144,6 +148,9 @@ struct NotificationSettingsSection: View {
                     .font(.caption)
 
                 Toggle("Keep watching after it's up (report re-hibernation)", isOn: binding(\.keepWatchingWhenUp))
+                    .font(.caption)
+
+                Toggle("Pipelines: also notify at each step (approvals and results always notify)", isOn: binding(\.pipelineSteps))
                     .font(.caption)
             }
             .disabled(!model.notificationSettings.enabled)
@@ -311,6 +318,19 @@ struct ProgramSettingsCard: View {
                 }
             }
 
+            // Status source
+            Picker("Status from", selection: Binding(
+                get: { program.accountId ?? "" },
+                set: { model.setAccount($0.isEmpty ? nil : $0, forProgramAt: programIndex) }
+            )) {
+                Text("Login page check (no credentials)").tag("")
+                ForEach(model.config.accounts) { a in
+                    Text("Cloud Manager API: \(a.label)").tag(a.id)
+                }
+            }
+            .font(.caption)
+            .padding(.leading, 12)
+
             // Environment list
             ForEach(program.environments.indices, id: \.self) { ei in
                 if editingEnvIndex == ei {
@@ -406,5 +426,155 @@ struct ProgramSettingsCard: View {
             RoundedRectangle(cornerRadius: 6)
                 .fill(Color.primary.opacity(0.04))
         )
+    }
+}
+
+
+// MARK: - Cloud Manager API credentials
+
+/// OAuth Server-to-Server credentials from Adobe Developer Console. Client
+/// id, org id and scopes go in config.json; the client secret goes in the
+/// macOS Keychain only.
+struct CloudManagerAccountsSection: View {
+    @ObservedObject var model: EnvironmentModel
+
+    @State private var editingId: String? = nil   // "new" for the add form
+    @State private var label = ""
+    @State private var clientId = ""
+    @State private var orgId = ""
+    @State private var scopes = CloudManagerAccount.defaultScopes
+    @State private var secret = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Cloud Manager API")
+                .font(.subheadline.weight(.semibold))
+            Text("Matches Cloud Manager's status exactly (including Restarting) and enables pipeline watching. Needs an OAuth Server-to-Server credential with the Cloud Manager API and the Developer product profile, from Adobe Developer Console. One credential per IMS org. The client secret is stored in the macOS Keychain.")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            ForEach(model.config.accounts) { a in
+                if editingId == a.id {
+                    form(existing: a)
+                } else {
+                    accountRow(a)
+                }
+            }
+
+            if editingId == "new" {
+                form(existing: nil)
+            } else if editingId == nil {
+                Button("Add Credential") { begin(nil) }
+                    .controlSize(.small)
+            }
+        }
+    }
+
+    private func accountRow(_ a: CloudManagerAccount) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(a.label).font(.caption.weight(.semibold))
+                Text(model.hasSecret(a.id) ? "secret in Keychain" : "no secret" as String)
+                    .font(.caption2)
+                    .foregroundColor(model.hasSecret(a.id) ? Color.secondary : Color.red)
+                Spacer()
+                if model.accountBusy.contains(a.id) {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button("Test") { model.testAccount(a.id) }
+                        .buttonStyle(.link)
+                        .font(.caption2)
+                }
+                Button { begin(a) } label: { Image(systemName: "pencil").font(.caption) }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.accentColor)
+                Button { model.removeAccount(a.id) } label: { Image(systemName: "trash").font(.caption) }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.red)
+            }
+            Text("Org \(a.orgId)")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            if let result = model.accountTestResult[a.id] {
+                Text(result)
+                    .font(.caption2)
+                    .foregroundColor(result.hasPrefix("Failed") || result.contains("NOT available") ? Color.red : Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let programs = model.accountPrograms[a.id], !programs.isEmpty {
+                Text("Programs this credential can see:")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                ForEach(programs) { p in
+                    HStack(spacing: 6) {
+                        Text("\(p.name) (\(p.id))").font(.caption2)
+                        Spacer()
+                        let linked = model.config.programs.first(where: { $0.id == p.id })
+                        if linked?.accountId == a.id {
+                            Text("added").font(.caption2).foregroundColor(.secondary)
+                        } else {
+                            let title: String = linked == nil ? "Add" : "Use API"
+                            Button(title) {
+                                model.importProgram(p, accountId: a.id)
+                            }
+                            .buttonStyle(.link)
+                            .font(.caption2)
+                            .disabled(model.accountBusy.contains(a.id))
+                        }
+                    }
+                    .padding(.leading, 8)
+                }
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04)))
+    }
+
+    private func form(existing: CloudManagerAccount?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            TextField("Label (e.g. foxx org)", text: $label)
+            TextField("Client ID (API key)", text: $clientId)
+            SecureField(existing == nil ? "Client secret" : "Client secret (leave blank to keep)" as String, text: $secret)
+            TextField("Organization ID (…@AdobeOrg)", text: $orgId)
+            TextField("Scopes (comma-separated, from Developer Console)", text: $scopes)
+            HStack {
+                Button("Save") {
+                    var a = existing ?? CloudManagerAccount(label: "", clientId: "", orgId: "", scopes: "")
+                    a.label = label.trimmingCharacters(in: .whitespaces)
+                    a.clientId = clientId.trimmingCharacters(in: .whitespaces)
+                    a.orgId = orgId.trimmingCharacters(in: .whitespaces)
+                    a.scopes = scopes.trimmingCharacters(in: .whitespaces)
+                    model.saveAccount(a, secret: secret)
+                    secret = ""
+                    editingId = nil
+                    model.testAccount(a.id)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(label.trimmingCharacters(in: .whitespaces).isEmpty
+                          || clientId.trimmingCharacters(in: .whitespaces).isEmpty
+                          || orgId.trimmingCharacters(in: .whitespaces).isEmpty
+                          || (existing == nil && secret.isEmpty))
+                Button("Cancel") {
+                    secret = ""
+                    editingId = nil
+                }
+                .controlSize(.small)
+            }
+        }
+        .textFieldStyle(.roundedBorder)
+        .font(.caption)
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04)))
+    }
+
+    private func begin(_ a: CloudManagerAccount?) {
+        editingId = a?.id ?? "new"
+        label = a?.label ?? ""
+        clientId = a?.clientId ?? ""
+        orgId = a?.orgId ?? ""
+        scopes = a?.scopes ?? CloudManagerAccount.defaultScopes
+        secret = ""
     }
 }

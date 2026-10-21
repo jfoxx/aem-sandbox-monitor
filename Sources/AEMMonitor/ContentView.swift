@@ -15,7 +15,7 @@ struct ContentView: View {
                 monitorView
             }
         }
-        .frame(width: 340, height: 440)
+        .frame(width: 360, height: 520)
     }
 
     // MARK: - Monitor (main) view
@@ -27,7 +27,7 @@ struct ContentView: View {
                 Text("AEM Monitor")
                     .font(.headline)
                 Spacer()
-                if model.anyWatching {
+                if model.anyWatching || model.anyPipelineWatching {
                     Button("Stop All") { model.stopAll() }
                         .buttonStyle(.plain)
                         .foregroundColor(.red)
@@ -136,16 +136,173 @@ struct ProgramSection: View {
         model.programs[programIndex]
     }
 
+    private var usesAPI: Bool { program.accountId != nil && model.account(withId: program.accountId) != nil }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("\(program.name)  (\(program.id))")
-                .font(.subheadline.weight(.semibold))
-                .foregroundColor(.secondary)
+            HStack(spacing: 6) {
+                Text("\(program.name)  (\(program.id))")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text(usesAPI ? "Cloud Manager API" : "Login page check")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                if usesAPI, let url = model.cloudManagerURL(programId: program.id) {
+                    Button {
+                        NSWorkspace.shared.open(url)
+                    } label: {
+                        Image(systemName: "arrow.up.right.square")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.accentColor)
+                    .help("Open this program in Cloud Manager")
+                }
+            }
 
             ForEach(program.environments.indices, id: \.self) { ei in
                 EnvironmentRow(model: model, programIndex: programIndex, envIndex: ei)
             }
+
+            if usesAPI {
+                PipelineSection(model: model, programId: program.id)
+            }
         }
+    }
+}
+
+// MARK: - Pipelines (Cloud Manager API programs only)
+
+struct PipelineSection: View {
+    @ObservedObject var model: EnvironmentModel
+    let programId: String
+    @State private var expanded = false
+
+    private var list: [PipelineRuntime] { model.pipelines[programId] ?? [] }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Button {
+                    expanded.toggle()
+                    if expanded { model.loadPipelinesIfNeeded(programId: programId) }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                        Text("Pipelines")
+                            .font(.caption.weight(.semibold))
+                        let watching = list.filter(\.isWatching).count
+                        if watching > 0 {
+                            Text("\(watching) watched")
+                                .font(.caption2)
+                                .foregroundColor(.orange)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.secondary)
+                Spacer()
+                if expanded {
+                    if model.pipelinesLoading.contains(programId) {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Button {
+                            model.refreshPipelines(programId: programId)
+                        } label: {
+                            Image(systemName: "arrow.clockwise").font(.system(size: 10))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(.secondary)
+                        .help("Refresh pipelines")
+                    }
+                }
+            }
+            .padding(.top, 2)
+
+            if expanded {
+                if let err = model.pipelineLoadError[programId] {
+                    Text(err)
+                        .font(.caption2)
+                        .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                ForEach(list) { p in
+                    PipelineRow(model: model, pipeline: p)
+                }
+                if list.isEmpty && !model.pipelinesLoading.contains(programId) && model.pipelineLoadError[programId] == nil {
+                    Text("No pipelines")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+}
+
+struct PipelineRow: View {
+    @ObservedObject var model: EnvironmentModel
+    let pipeline: PipelineRuntime
+
+    private var dot: String {
+        if pipeline.error != nil { return "🔴" }
+        guard let e = pipeline.execution else { return "⚫" }
+        switch e.status {
+        case "FINISHED":            return "🟢"
+        case "FAILED", "ERROR":     return "🔴"
+        case "CANCELLED":           return "⚫"
+        default:                    return e.activeStep?.status == "WAITING" ? "🟡" : "🟠"
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(dot).font(.system(size: 10))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(pipeline.name)
+                    .font(.caption)
+                    .lineLimit(1)
+                Text(pipeline.summary)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            if let e = pipeline.execution,
+               let url = model.executionURL(programId: pipeline.programId, pipelineId: pipeline.pipelineId, executionId: e.id) {
+                Button {
+                    NSWorkspace.shared.open(url)
+                } label: {
+                    Image(systemName: "arrow.up.right.square").font(.system(size: 10))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.secondary)
+                .help("Open this run in Cloud Manager")
+            }
+            if pipeline.isWatching {
+                Button("Stop") {
+                    model.stopWatchingPipeline(programId: pipeline.programId, pipelineId: pipeline.pipelineId)
+                }
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundColor(.orange)
+            } else {
+                Button("Watch") {
+                    model.startWatchingPipeline(programId: pipeline.programId, pipelineId: pipeline.pipelineId)
+                }
+                .buttonStyle(.plain)
+                .font(.caption)
+                .foregroundColor(.accentColor)
+            }
+        }
+        .padding(.vertical, 2)
+        .padding(.horizontal, 6)
+        .padding(.leading, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 4)
+                .fill(pipeline.isWatching ? Color.accentColor.opacity(0.07) : Color.clear)
+        )
     }
 }
 

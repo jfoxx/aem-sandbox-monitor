@@ -34,6 +34,17 @@ final class EnvironmentModel: ObservableObject {
     /// Time the last notification was handed to macOS successfully.
     @Published var lastNotificationSent: Date? = nil
 
+    /// Pipelines per program id (Cloud Manager API programs only).
+    @Published var pipelines: [String: [PipelineRuntime]] = [:]
+    @Published var pipelineLoadError: [String: String] = [:]
+    @Published var pipelinesLoading: Set<String> = []
+
+    /// Result of the last "Test" per account id, shown in Settings.
+    @Published var accountTestResult: [String: String] = [:]
+    /// Programs the account can see, offered for adding in Settings.
+    @Published var accountPrograms: [String: [CMProgram]] = [:]
+    @Published var accountBusy: Set<String> = []
+
     // MARK: - Internals
 
     private let pollInterval: TimeInterval = 30
@@ -44,6 +55,10 @@ final class EnvironmentModel: ObservableObject {
     /// .error). Used to detect transitions; cleared when a watch stops so a
     /// new watch starts from a fresh baseline.
     private var lastSettled: [String: EnvironmentStatus] = [:]
+
+    private var pipelineTimers: [String: Timer] = [:]          // PipelineRuntime.id → Timer
+    /// Last execution seen per watched pipeline; nil entry = never ran.
+    private var lastExecution: [String: CMExecution?] = [:]
 
     // MARK: - Init
 
@@ -68,6 +83,8 @@ final class EnvironmentModel: ObservableObject {
     var anyWatching: Bool {
         programs.flatMap(\.environments).contains { $0.isWatching }
     }
+
+    var anyPipelineWatching: Bool { !pipelineTimers.isEmpty }
 
     // MARK: - Config mutations (CRUD)
 
@@ -151,6 +168,347 @@ final class EnvironmentModel: ObservableObject {
         rebuildPrograms()
     }
 
+    // MARK: - Cloud Manager accounts
+
+    func account(withId id: String?) -> CloudManagerAccount? {
+        guard let id else { return nil }
+        return config.accounts.first(where: { $0.id == id })
+    }
+
+    func account(forProgramId programId: String) -> CloudManagerAccount? {
+        account(withId: config.programs.first(where: { $0.id == programId })?.accountId)
+    }
+
+    func usesCloudManager(programId: String) -> Bool {
+        account(forProgramId: programId) != nil
+    }
+
+    func hasSecret(_ accountId: String) -> Bool {
+        KeychainStore.hasSecret(for: accountId)
+    }
+
+    /// Adds or updates an account. An empty secret keeps the stored one.
+    func saveAccount(_ account: CloudManagerAccount, secret: String) {
+        let trimmed = secret.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            KeychainStore.setSecret(trimmed, for: account.id)
+        }
+        if let i = config.accounts.firstIndex(where: { $0.id == account.id }) {
+            config.accounts[i] = account
+        } else {
+            config.accounts.append(account)
+        }
+        ConfigStore.save(config)
+        Task { await IMSTokenProvider.shared.invalidate(account.id) }
+        accountTestResult[account.id] = nil
+    }
+
+    func removeAccount(_ accountId: String) {
+        for pi in config.programs.indices where config.programs[pi].accountId == accountId {
+            stopAllInProgram(pi)
+            stopPipelineWatches(programId: config.programs[pi].id)
+            config.programs[pi].accountId = nil
+        }
+        config.accounts.removeAll { $0.id == accountId }
+        KeychainStore.deleteSecret(for: accountId)
+        ConfigStore.save(config)
+        rebuildPrograms()
+        accountTestResult[accountId] = nil
+        accountPrograms[accountId] = nil
+    }
+
+    /// Switches a program between the login-page check (nil) and an account.
+    func setAccount(_ accountId: String?, forProgramAt pi: Int) {
+        guard config.programs.indices.contains(pi) else { return }
+        stopAllInProgram(pi)
+        let programId = config.programs[pi].id
+        stopPipelineWatches(programId: programId)
+        pipelines[programId] = nil
+        pipelineLoadError[programId] = nil
+        config.programs[pi].accountId = accountId
+        ConfigStore.save(config)
+        rebuildPrograms()
+        if accountId != nil { refreshProgramDetails(programId: programId) }
+    }
+
+    /// Settings > Test: gets a token, lists programs, checks Restarting detection.
+    func testAccount(_ accountId: String) {
+        guard let account = self.account(withId: accountId) else { return }
+        accountBusy.insert(accountId)
+        accountTestResult[accountId] = "Testing…"
+        Task {
+            let client = CloudManagerClient(account: account)
+            do {
+                let programs = try await client.programs()
+                self.accountPrograms[accountId] = programs
+                var lines = ["OK: token issued, \(programs.count) program(s) visible"]
+                if let first = programs.first(where: { p in self.config.programs.contains(where: { $0.id == p.id }) }) ?? programs.first {
+                    lines.append(await client.restartDetectionCheck(programId: first.id))
+                }
+                self.accountTestResult[accountId] = lines.joined(separator: "\n")
+            } catch {
+                self.accountTestResult[accountId] = "Failed: \(error.localizedDescription)"
+            }
+            self.accountBusy.remove(accountId)
+        }
+    }
+
+    /// Adds a program (and all its environments) from the API, or links an
+    /// existing program with the same id to this account.
+    func importProgram(_ program: CMProgram, accountId: String) {
+        guard let account = self.account(withId: accountId) else { return }
+        accountBusy.insert(accountId)
+        Task {
+            let client = CloudManagerClient(account: account)
+            do {
+                let envs = try await client.environments(programId: program.id)
+                let envConfigs = envs
+                    .filter { $0.type != "rde" }
+                    .sorted { Self.envOrder($0.type) < Self.envOrder($1.type) }
+                    .map { EnvironmentConfig(id: $0.id, name: $0.type.isEmpty ? $0.name : $0.type) }
+                if let pi = self.config.programs.firstIndex(where: { $0.id == program.id }) {
+                    self.stopAllInProgram(pi)
+                    self.config.programs[pi].accountId = accountId
+                    self.config.programs[pi].tenantId = program.tenantId
+                    let known = Set(self.config.programs[pi].environments.map(\.id))
+                    self.config.programs[pi].environments += envConfigs.filter { !known.contains($0.id) }
+                } else {
+                    self.config.programs.append(ProgramConfig(id: program.id, name: program.name,
+                                                              environments: envConfigs,
+                                                              accountId: accountId,
+                                                              tenantId: program.tenantId))
+                }
+                ConfigStore.save(self.config)
+                self.rebuildPrograms()
+                self.accountTestResult[accountId] = "Added \(program.name) with \(envConfigs.count) environment(s)"
+            } catch {
+                self.accountTestResult[accountId] = "Could not add \(program.name): \(error.localizedDescription)"
+            }
+            self.accountBusy.remove(accountId)
+        }
+    }
+
+    private static func envOrder(_ type: String) -> Int {
+        ["dev": 0, "stage": 1, "prod": 2, "preprod": 3][type] ?? 9
+    }
+
+    /// Fetches the program's tenant id (for Cloud Manager deep links) once.
+    private func refreshProgramDetails(programId: String) {
+        guard let account = self.account(forProgramId: programId),
+              let pi = config.programs.firstIndex(where: { $0.id == programId }),
+              config.programs[pi].tenantId == nil else { return }
+        Task {
+            if let p = try? await CloudManagerClient(account: account).program(id: programId),
+               let i = self.config.programs.firstIndex(where: { $0.id == programId }) {
+                self.config.programs[i].tenantId = p.tenantId
+                ConfigStore.save(self.config)
+                self.rebuildPrograms()
+            }
+        }
+    }
+
+    // MARK: - Pipelines
+
+    func loadPipelinesIfNeeded(programId: String) {
+        guard usesCloudManager(programId: programId),
+              pipelines[programId] == nil,
+              !pipelinesLoading.contains(programId) else { return }
+        refreshPipelines(programId: programId)
+    }
+
+    func refreshPipelines(programId: String) {
+        guard let account = self.account(forProgramId: programId) else { return }
+        pipelinesLoading.insert(programId)
+        refreshProgramDetails(programId: programId)
+        Task {
+            let client = CloudManagerClient(account: account)
+            do {
+                let list = try await client.pipelines(programId: programId)
+                let existing = Dictionary((self.pipelines[programId] ?? []).map { ($0.pipelineId, $0) }, uniquingKeysWith: { a, _ in a })
+                var runtimes: [PipelineRuntime] = []
+                for p in list {
+                    var r = existing[p.id] ?? PipelineRuntime(programId: programId, pipelineId: p.id,
+                                                              name: p.name, pipelineStatus: p.status)
+                    r.name = p.name
+                    r.pipelineStatus = p.status
+                    r.isWatching = self.pipelineTimers[r.id] != nil
+                    runtimes.append(r)
+                }
+                self.pipelines[programId] = runtimes
+                self.pipelineLoadError[programId] = nil
+                // Fill in each pipeline's latest run once, for the summary line.
+                for r in runtimes where r.execution == nil && !r.isWatching {
+                    if let e = try? await client.latestExecution(programId: programId, pipelineId: r.pipelineId) {
+                        self.updatePipeline(programId: programId, pipelineId: r.pipelineId) { $0.execution = e }
+                    }
+                }
+            } catch {
+                self.pipelineLoadError[programId] = error.localizedDescription
+            }
+            self.pipelinesLoading.remove(programId)
+        }
+    }
+
+    func startWatchingPipeline(programId: String, pipelineId: String) {
+        let key = "\(programId)-\(pipelineId)"
+        guard pipelineTimers[key] == nil else { return }
+        updatePipeline(programId: programId, pipelineId: pipelineId) { $0.isWatching = true }
+        pollPipeline(programId: programId, pipelineId: pipelineId)
+        pipelineTimers[key] = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.pollPipeline(programId: programId, pipelineId: pipelineId) }
+        }
+    }
+
+    func stopWatchingPipeline(programId: String, pipelineId: String) {
+        let key = "\(programId)-\(pipelineId)"
+        pipelineTimers[key]?.invalidate()
+        pipelineTimers.removeValue(forKey: key)
+        lastExecution.removeValue(forKey: key)
+        updatePipeline(programId: programId, pipelineId: pipelineId) { $0.isWatching = false }
+    }
+
+    private func stopPipelineWatches(programId: String) {
+        for r in pipelines[programId] ?? [] where pipelineTimers[r.id] != nil {
+            stopWatchingPipeline(programId: programId, pipelineId: r.pipelineId)
+        }
+    }
+
+    private func updatePipeline(programId: String, pipelineId: String, _ change: (inout PipelineRuntime) -> Void) {
+        guard var list = pipelines[programId],
+              let i = list.firstIndex(where: { $0.pipelineId == pipelineId }) else { return }
+        change(&list[i])
+        pipelines[programId] = list
+    }
+
+    private func pollPipeline(programId: String, pipelineId: String) {
+        guard let account = self.account(forProgramId: programId) else {
+            stopWatchingPipeline(programId: programId, pipelineId: pipelineId)
+            return
+        }
+        let key = "\(programId)-\(pipelineId)"
+        Task {
+            let result: CMExecution?
+            do {
+                result = try await CloudManagerClient(account: account)
+                    .latestExecution(programId: programId, pipelineId: pipelineId)
+            } catch {
+                // Transient: shown inline, never notifies, baseline unchanged.
+                self.updatePipeline(programId: programId, pipelineId: pipelineId) {
+                    $0.error = error.localizedDescription
+                    $0.lastCheck = Date()
+                }
+                return
+            }
+            guard self.pipelineTimers[key] != nil else { return }   // stopped meanwhile
+
+            let isFirstPoll = self.lastExecution[key] == nil
+            let previous: CMExecution? = self.lastExecution[key] ?? nil
+            self.lastExecution[key] = .some(result)
+            self.updatePipeline(programId: programId, pipelineId: pipelineId) {
+                $0.execution = result
+                $0.error = nil
+                $0.lastCheck = Date()
+            }
+            guard let current = result else { return }
+
+            let name = self.pipelines[programId]?.first(where: { $0.pipelineId == pipelineId })?.name ?? pipelineId
+            let programName = self.config.programs.first(where: { $0.id == programId })?.name ?? programId
+            let url = self.executionURL(programId: programId, pipelineId: pipelineId, executionId: current.id)
+            let settings = self.config.notifications
+            let location = "\(programName) / \(name)"
+            let sameRun = previous?.id == current.id
+            let waiting = current.steps.first(where: { $0.status == "WAITING" })
+            let previousWaiting: CMStep? = sameRun ? previous?.steps.first(where: { $0.status == "WAITING" }) : nil
+
+            if isFirstPoll {
+                // Baseline only, except a run that is already waiting on someone.
+                if let waiting, !current.isTerminal {
+                    self.sendPipelineNotification(title: "Pipeline Waiting",
+                                                  body: "\(location): \(waiting.displayName) needs action",
+                                                  threadId: key, url: url, settings: settings)
+                }
+                return
+            }
+
+            if !sameRun {
+                if current.isTerminal {
+                    // A whole run happened between polls.
+                    self.notifyPipelineResult(current, location: location, threadId: key, url: url, settings: settings)
+                    self.finishPipelineWatchIfNeeded(programId: programId, pipelineId: pipelineId, settings: settings)
+                } else {
+                    self.sendPipelineNotification(title: "Pipeline Started",
+                                                  body: "\(location): \(current.summary)",
+                                                  threadId: key, url: url, settings: settings)
+                }
+                return
+            }
+
+            guard let previous, previous != current else { return }
+
+            if current.isTerminal && !previous.isTerminal {
+                self.notifyPipelineResult(current, location: location, threadId: key, url: url, settings: settings)
+                self.finishPipelineWatchIfNeeded(programId: programId, pipelineId: pipelineId, settings: settings)
+                return
+            }
+            if let waiting, waiting.key != previousWaiting?.key {
+                self.sendPipelineNotification(title: "Pipeline Waiting",
+                                              body: "\(location): \(waiting.displayName) needs action",
+                                              threadId: key, url: url, settings: settings)
+                return
+            }
+            if settings.pipelineSteps,
+               let active = current.activeStep, active.status == "RUNNING",
+               active.key != previous.activeStep?.key {
+                self.sendPipelineNotification(title: "Pipeline Step",
+                                              body: "\(location): \(active.displayName)",
+                                              threadId: key, url: url, settings: settings)
+            }
+        }
+    }
+
+    private func notifyPipelineResult(_ e: CMExecution, location: String, threadId: String,
+                                      url: URL?, settings: NotificationSettings) {
+        let title: String
+        switch e.status {
+        case "FINISHED":  title = "Pipeline Succeeded"
+        case "CANCELLED": title = "Pipeline Cancelled"
+        default:          title = "Pipeline Failed"
+        }
+        var body = "\(location): \(e.summary)"
+        if let start = e.createdAt, let end = e.finishedAt {
+            let minutes = Int((end.timeIntervalSince(start) / 60).rounded())
+            body += " after \(minutes) min"
+        }
+        sendPipelineNotification(title: title, body: body, threadId: threadId, url: url, settings: settings)
+        if e.status == "FINISHED" { onEnvironmentWokeUp?() }
+    }
+
+    private func finishPipelineWatchIfNeeded(programId: String, pipelineId: String, settings: NotificationSettings) {
+        if !settings.keepWatchingWhenUp {
+            stopWatchingPipeline(programId: programId, pipelineId: pipelineId)
+        }
+    }
+
+    private func sendPipelineNotification(title: String, body: String, threadId: String,
+                                          url: URL?, settings: NotificationSettings) {
+        guard settings.enabled else { return }
+        deliver(title: title, body: body, threadId: threadId, url: url, sound: settings.sound)
+    }
+
+    /// Deep link to the execution in Cloud Manager.
+    func executionURL(programId: String, pipelineId: String, executionId: String) -> URL? {
+        let path = "cloud-manager/pipelineexecution.html/program/\(programId)/pipeline/\(pipelineId)/execution/\(executionId)"
+        return cloudManagerURL(programId: programId, path: path)
+    }
+
+    func cloudManagerURL(programId: String, path: String? = nil) -> URL? {
+        let p = path ?? "cloud-manager/home.html/program/\(programId)"
+        if let tenant = config.programs.first(where: { $0.id == programId })?.tenantId, !tenant.isEmpty {
+            return URL(string: "https://experience.adobe.com/#/@\(tenant)/\(p)")
+        }
+        return URL(string: "https://experience.adobe.com/#/\(p)")
+    }
+
     // MARK: - Notification settings
 
     var notificationSettings: NotificationSettings { config.notifications }
@@ -219,6 +577,11 @@ final class EnvironmentModel: ObservableObject {
     }
 
     func stopAll() {
+        for (programId, list) in pipelines {
+            for p in list where p.isWatching {
+                stopWatchingPipeline(programId: programId, pipelineId: p.pipelineId)
+            }
+        }
         for pi in programs.indices {
             for ei in programs[pi].environments.indices {
                 if programs[pi].environments[ei].isWatching {
@@ -251,9 +614,21 @@ final class EnvironmentModel: ObservableObject {
         guard programs.indices.contains(pi),
               programs[pi].environments.indices.contains(ei) else { return }
         let env = programs[pi].environments[ei]
+        let account = self.account(forProgramId: env.programId)
         programs[pi].environments[ei].status = .checking
         Task {
-            let result = await EnvironmentChecker.check(url: env.url)
+            let result: EnvironmentStatus
+            if let account {
+                // Same status Cloud Manager shows, including "Restarting".
+                do {
+                    result = try await CloudManagerClient(account: account)
+                        .environmentStatus(programId: env.programId, envId: env.envId)
+                } catch {
+                    result = .error(error.localizedDescription)
+                }
+            } else {
+                result = await EnvironmentChecker.check(url: env.url)
+            }
             // Bounds-check again — config may have changed during the await.
             guard self.programs.indices.contains(pi),
                   self.programs[pi].environments.indices.contains(ei),
@@ -347,8 +722,10 @@ final class EnvironmentModel: ObservableObject {
         let title: String
         switch current {
         case .up:         title = "AEM Environment Ready"
-        case .starting:   title = "AEM Environment Starting"
+        case .starting:   title = "AEM Environment Restarting"
         case .hibernated: title = "AEM Environment Hibernated"
+        case .updating:   title = "AEM Environment Updating"
+        case .failed:     title = "AEM Environment Problem"
         case .down:       title = "AEM Environment Down"
         default:          title = "AEM Environment \(current.label)"
         }

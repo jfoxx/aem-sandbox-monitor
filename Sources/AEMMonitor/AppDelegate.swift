@@ -34,7 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Popover
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 340, height: 440)
+        popover.contentSize = NSSize(width: 360, height: 520)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: ContentView(model: model))
 
@@ -94,7 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let color: NSColor
 
-        if model.anyWatching {
+        if model.anyWatching || model.anyPipelineWatching {
             color = .systemOrange
         } else if model.programs.flatMap(\.environments).contains(where: { $0.status == .up }) {
             color = .systemGreen

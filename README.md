@@ -31,6 +31,40 @@ Monitors AEM Cloud Service author environments by polling their login page:
 - **HTTP 200 + no "hibernat" in body** → Up / Awake
 - **Non-200 status** → Down
 
+## Cloud Manager API mode (1.2.0)
+
+Each program can get its status from either:
+
+| Source | Credentials | Matches Cloud Manager | Pipelines |
+|---|---|---|---|
+| Login page check (default) | none | approximately: author can accept logins before Cloud Manager stops showing "Restarting" | no |
+| Cloud Manager API | OAuth Server-to-Server | yes: same status fields the Cloud Manager UI reads, including "Restarting" | yes |
+
+### Create the credential (once per IMS org)
+
+1. In [Adobe Developer Console](https://developer.adobe.com/console), create a project in the org that owns the program.
+   You need to be a System Administrator, or have Developer Access for a Cloud Manager product profile.
+2. Add API > **Cloud Manager**, choose **OAuth Server-to-Server**, and select the **Developer** product profile (read-only is enough).
+3. Copy the Client ID, Client Secret, Organization ID and Scopes from the credential page.
+
+### Add it to the app
+
+Settings > **Cloud Manager API** > Add Credential, paste the values, Save. Saving runs a test that:
+
+- requests a token,
+- lists the programs the credential can see (each has **Add** / **Use API**),
+- reports whether "Restarting" detection is available for that credential.
+
+Or pick the credential per program under **Status from**. The client secret is stored in the macOS Keychain
+(service `com.adobe.aem-monitor.cloudmanager`), never in config.json.
+
+### Pipelines
+
+Programs using the API show a **Pipelines** list. **Watch** a pipeline to get notified when a run starts,
+when a step is waiting for approval, and when it succeeds, fails or is cancelled. Turn on
+"Pipelines: also notify at each step" in Settings for a notification per step. Clicking a notification opens the
+run in Cloud Manager.
+
 ## Configuration
 
 All programs and environments are **user-configurable** via the Settings view (gear icon in the popover).
